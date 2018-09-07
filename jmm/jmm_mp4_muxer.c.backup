@@ -1,0 +1,1505 @@
+/*
+ * jmm_mp4_muxer.c
+ *
+ * @chuanjiong
+ */
+
+#include "jmm_module.h"
+
+/*
+
+ftyp
+
+moov
+    mvhd
+    trak
+        tkhd
+        mdia
+            mdhd
+            hdlr
+            minf
+                (vmhd, smhd, hmhd, nmhd)
+                stbl
+                    stsd
+                    stts
+                    (stsz, stz2)
+                    stsc
+                    (stco, co64)
+                    ctts
+                    stss
+                dinf
+                    (url , urn , dref)
+
+mdat
+
+*/
+
+/*
+
+aligned(8) class Box (unsigned int(32) boxtype, optional unsigned int(8)[16] extended_type)
+{
+    unsigned int(32) size;
+    unsigned int(32) type = boxtype;
+    if (size == 1)
+    {
+        unsigned int(64) largesize;
+    }
+    else if (size == 0)
+    {
+        // box extends to end of file
+    }
+    if (boxtype == "uuid")
+    {
+        unsigned int(8)[16] usertype = extended_type;
+    }
+}
+
+aligned(8) class FullBox (unsigned int(32) boxtype, unsigned int(8) v, bit(24) f)
+{
+    extends Box(boxtype)
+
+    unsigned int(8) version = v;
+    bit(24) flags = f;
+}
+
+mp4 file structure
+
+"ftyp"
+    aligned(8) class FileTypeBox
+    {
+        extends Box("ftyp")
+
+        unsigned int(32) major_brand;
+        unsigned int(32) minor_version;
+        unsigned int(32) compatible_brands[]; // to end of the box
+    }
+
+"moov"
+    "mvhd"
+        aligned(8) class MovieHeaderBox
+        {
+            extends FullBox("mvhd", version, 0)
+            if (version == 1)
+            {
+                unsigned int(64) creation_time;
+                unsigned int(64) modification_time;
+                unsigned int(32) timescale;
+                unsigned int(64) duration;
+            }
+            else // version == 0
+            {
+                unsigned int(32) creation_time;
+                unsigned int(32) modification_time;
+                unsigned int(32) timescale;
+                unsigned int(32) duration;
+            }
+            template int(32) rate = 0x00010000; // typically 1.0
+            template int(16) volume = 0x0100; // typically, full volume
+            const bit(16) reserved = 0;
+            const unsigned int(32)[2] reserved = 0;
+            template int(32)[9] matrix =
+            { 0x00010000,0,0,0,0x00010000,0,0,0,0x40000000 };
+            // Unity matrix
+            bit(32)[6] pre_defined = 0;
+            unsigned int(32) next_track_ID;
+        }
+
+    "trak"
+        "tkhd"
+            aligned(8) class TrackHeaderBox
+            {
+                extends FullBox("tkhd", version, flags)
+                if (version == 1)
+                {
+                    unsigned int(64) creation_time;
+                    unsigned int(64) modification_time;
+                    unsigned int(32) track_ID;
+                    const unsigned int(32) reserved = 0;
+                    unsigned int(64) duration;
+                }
+                else // version == 0
+                {
+                    unsigned int(32) creation_time;
+                    unsigned int(32) modification_time;
+                    unsigned int(32) track_ID;
+                    const unsigned int(32) reserved = 0;
+                    unsigned int(32) duration;
+                }
+                const unsigned int(32)[2] reserved = 0;
+                template int(16) layer = 0;
+                template int(16) alternate_group = 0;
+                template int(16) volume = {if track_is_audio 0x0100 else 0};
+                const unsigned int(16) reserved = 0;
+                template int(32)[9] matrix=
+                { 0x00010000,0,0,0,0x00010000,0,0,0,0x40000000 };
+                // unity matrix
+                unsigned int(32) width;
+                unsigned int(32) height;
+            }
+
+        "mdia"
+            "mdhd"
+                aligned(8) class MediaHeaderBox
+                {
+                    extends FullBox("mdhd", version, 0)
+                    if (version == 1)
+                    {
+                        unsigned int(64) creation_time;
+                        unsigned int(64) modification_time;
+                        unsigned int(32) timescale;
+                        unsigned int(64) duration;
+                    }
+                    else // version == 0
+                    {
+                        unsigned int(32) creation_time;
+                        unsigned int(32) modification_time;
+                        unsigned int(32) timescale;
+                        unsigned int(32) duration;
+                    }
+                    bit(1) pad = 0;
+                    unsigned int(5)[3] language; // ISO-639-2/T language code
+                    unsigned int(16) pre_defined = 0;
+                }
+
+            "hdlr"
+                aligned(8) class HandlerBox
+                {
+                    extends FullBox("hdlr", version = 0, 0)
+                    unsigned int(32) pre_defined = 0;
+                    unsigned int(32) handler_type;
+                    const unsigned int(32)[3] reserved = 0;
+                    string name;
+                }
+
+            "minf"
+                (vmhd, smhd, hmhd, nmhd)
+                    aligned(8) class VideoMediaHeaderBox
+                    {
+                        extends FullBox("vmhd", version = 0, 1)
+                        template unsigned int(16) graphicsmode = 0; // copy, see below
+                        template unsigned int(16)[3] opcolor = {0, 0, 0};
+                    }
+                    aligned(8) class SoundMediaHeaderBox
+                    {
+                        extends FullBox("smhd", version = 0, 0)
+                        template int(16) balance = 0;
+                        const unsigned int(16) reserved = 0;
+                    }
+                    aligned(8) class HintMediaHeaderBox
+                    {
+                        extends FullBox("hmhd", version = 0, 0)
+                        unsigned int(16) maxPDUsize;
+                        unsigned int(16) avgPDUsize;
+                        unsigned int(32) maxbitrate;
+                        unsigned int(32) avgbitrate;
+                        unsigned int(32) reserved = 0;
+                    }
+                    aligned(8) class NullMediaHeaderBox
+                    {
+                        extends FullBox("nmhd", version = 0, flags)
+                    }
+
+                "stbl"
+                    "stsd"
+                        aligned(8) abstract class SampleEntry (unsigned int(32) format)
+                        {
+                            extends Box(format)
+                            const unsigned int(8)[6] reserved = 0;
+                            unsigned int(16) data_reference_index;
+                        }
+                        class HintSampleEntry()
+                        {
+                            extends SampleEntry (protocol)
+                            unsigned int(8) data [];
+                        }
+                        class MetaDataSampleEntry(codingname)
+                        {
+                            extends SampleEntry (codingname)
+                        }
+                        // Visual Sequences
+                        class PixelAspectRatioBox
+                        {
+                            extends Box("pasp")
+                            unsigned int(32) hSpacing;
+                            unsigned int(32) vSpacing;
+                        }
+                        class CleanApertureBox
+                        {
+                            extends Box("clap")
+                            unsigned int(32) cleanApertureWidthN;
+                            unsigned int(32) cleanApertureWidthD;
+                            unsigned int(32) cleanApertureHeightN;
+                            unsigned int(32) cleanApertureHeightD;
+                            unsigned int(32) horizOffN;
+                            unsigned int(32) horizOffD;
+                            unsigned int(32) vertOffN;
+                            unsigned int(32) vertOffD;
+                        }
+                        class VisualSampleEntry(codingname)
+                        {
+                            extends SampleEntry (codingname)
+                            unsigned int(16) pre_defined = 0;
+                            const unsigned int(16) reserved = 0;
+                            unsigned int(32)[3] pre_defined = 0;
+                            unsigned int(16) width;
+                            unsigned int(16) height;
+                            template unsigned int(32) horizresolution = 0x00480000; // 72 dpi
+                            template unsigned int(32) vertresolution = 0x00480000; // 72 dpi
+                            const unsigned int(32) reserved = 0;
+                            template unsigned int(16) frame_count = 1;
+                            string[32] compressorname;
+                            template unsigned int(16) depth = 0x0018;
+                            int(16) pre_defined = -1;
+                            // other boxes from derived specifications
+                            CleanApertureBox clap; // optional
+                            PixelAspectRatioBox pasp; // optional
+                        }
+                        // Audio Sequences
+                        class AudioSampleEntry(codingname)
+                        {
+                            extends SampleEntry (codingname)
+                            const unsigned int(32)[2] reserved = 0;
+                            template unsigned int(16) channelcount = 2;
+                            template unsigned int(16) samplesize = 16;
+                            unsigned int(16) pre_defined = 0;
+                            const unsigned int(16) reserved = 0 ;
+                            template unsigned int(32) samplerate = { default samplerate of media}<<16;
+                        }
+                        aligned(8) class SampleDescriptionBox (unsigned int(32) handler_type)
+                        {
+                            extends FullBox("stsd", 0, 0)
+                            int i;
+                            unsigned int(32) entry_count;
+                            for (i=1; i<=entry_count; i++)
+                            {
+                                switch (handler_type)
+                                {
+                                    case "soun": // for audio tracks
+                                        AudioSampleEntry();
+                                        break;
+                                    case "vide": // for video tracks
+                                        VisualSampleEntry();
+                                        break;
+                                    case "hint": // Hint track
+                                        HintSampleEntry();
+                                        break;
+                                    case "meta": // Metadata track
+                                        MetadataSampleEntry();
+                                        break;
+                                }
+                            }
+                        }
+
+                        //es
+                        {
+                            //mp4a
+                            (8) tag; (0x5 -> asc)
+                            (1~4) size;
+                        }
+
+                        aligned(8) class ESDBox
+                        {
+                            extends FullBox("esds", version = 0, 0)
+                            ES Descriptor ES;
+                        }
+                        // Visual Streams
+                        class MP4VisualSampleEntry()
+                        {
+                            extends VisualSampleEntry ("mp4v")
+                            ESDBox ES;
+                        }
+                        // Audio Streams
+                        class MP4AudioSampleEntry()
+                        {
+                            extends AudioSampleEntry ("mp4a")
+                            ESDBox ES;
+                        }
+                        // all other Mpeg stream types
+                        class MpegSampleEntry()
+                        {
+                            extends SampleEntry ("mp4s")
+                            ESDBox ES;
+                        }
+
+                    "stts"
+                        aligned(8) class TimeToSampleBox
+                        {
+                            extends FullBox("stts", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            int i;
+                            for (i=0; i < entry_count; i++)
+                            {
+                                unsigned int(32) sample_count;
+                                unsigned int(32) sample_delta;
+                            }
+                        }
+
+                    (stsz, stz2)
+                        aligned(8) class SampleSizeBox
+                        {
+                            extends FullBox("stsz", version = 0, 0)
+                            unsigned int(32) sample_size;
+                            unsigned int(32) sample_count;
+                            if (sample_size==0)
+                            {
+                                for (i=1; i <= sample_count; i++)
+                                {
+                                    unsigned int(32) entry_size;
+                                }
+                            }
+                        }
+                        aligned(8) class CompactSampleSizeBox
+                        {
+                            extends FullBox("stz2", version = 0, 0)
+                            unsigned int(24) reserved = 0;
+                            unisgned int(8) field_size;
+                            unsigned int(32) sample_count;
+                            for (i=1; i <= sample_count; i++)
+                            {
+                                unsigned int(field_size) entry_size;
+                            }
+                        }
+
+                    stsc
+                        aligned(8) class SampleToChunkBox
+                        {
+                            extends FullBox("stsc", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            for (i=1; i <= entry_count; i++)
+                            {
+                                unsigned int(32) first_chunk;
+                                unsigned int(32) samples_per_chunk;
+                                unsigned int(32) sample_description_index;
+                            }
+                        }
+
+                    (stco, co64)
+                        aligned(8) class ChunkOffsetBox
+                        {
+                            extends FullBox("stco", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            for (i=1; i <= entry_count; i++)
+                            {
+                                unsigned int(32) chunk_offset;
+                            }
+                        }
+                        aligned(8) class ChunkLargeOffsetBox
+                        {
+                            extends FullBox("co64", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            for (i=1; i <= entry_count; i++)
+                            {
+                                unsigned int(64) chunk_offset;
+                            }
+                        }
+
+                    "ctts"
+                        aligned(8) class CompositionOffsetBox
+                        {
+                            extends FullBox("ctts", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            int i;
+                            if (version == 0)
+                            {
+                                for (i=0; i<entry_count; i++)
+                                {
+                                    unsigned int(32) sample_count;
+                                    unsigned int(32) sample_offset;
+                                }
+                            }
+                            else if (version == 1)
+                            {
+                                for (i=0; i<entry_count; i++)
+                                {
+                                    unsigned int(32) sample_count;
+                                    signed int(32) sample_offset;
+                                }
+                            }
+                        }
+
+                    "stss"
+                        aligned(8) class SyncSampleBox
+                        {
+                            extends FullBox("stss", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            int i;
+                            for (i=0; i<entry_count; i++)
+                            {
+                                unsigned int(32) sample_number;
+                            }
+                        }
+
+                "dinf"
+                    (url , urn , dref)
+                        aligned(8) class DataEntryUrlBox (bit(24) flags)
+                        {
+                            extends FullBox("url ", version = 0, flags)
+                            string location;
+                        }
+                        aligned(8) class DataEntryUrnBox (bit(24) flags)
+                        {
+                            extends FullBox("urn ", version = 0, flags)
+                            string name;
+                            string location;
+                        }
+                        aligned(8) class DataReferenceBox
+                        {
+                            extends FullBox("dref", version = 0, 0)
+                            unsigned int(32) entry_count;
+                            for (i=1; i <= entry_count; i++)
+                            {
+                                DataEntryBox(entry_version, entry_flags) data_entry;
+                            }
+                        }
+
+"mdat"
+
+*/
+
+#define write_fourcc(a,b,c,d)       (WB32(((a)<<24)|((b)<<16)|((c)<<8)|(d)))
+
+typedef struct jmm_mp4_muxer_entry {
+    jbool key;
+    int64_t dts;
+    int64_t pts;
+    int size;
+    int64_t offset;
+    int64_t duration;
+}jmm_mp4_muxer_entry;
+
+typedef struct jmm_mp4_muxer_ctx {
+    jstring url;
+    time_t creation_time;
+
+    jhandle wt;
+    jhandle w_mdat;
+    jhandle w_aentry;
+    jhandle w_ventry;
+
+    int aentry_idx; //0, 1
+    jmm_mp4_muxer_entry aentry[2];
+    int ventry_idx; //0, 1
+    jmm_mp4_muxer_entry ventry[2];
+
+    int64_t prev_a_dts;
+    int64_t prev_v_dts;
+    int64_t a_sample_duration;
+    int64_t v_sample_duration;
+    int64_t a_duration;
+    int64_t v_duration;
+    int64_t a_dur_sec;
+    int64_t v_dur_sec;
+    int a_count;
+    int v_count;
+
+    jmm_packet *asc;
+    jmm_packet *avcc;
+
+    jmm_asc_info ainfo;
+    jmm_avcc_info vinfo;
+
+    int64_t fixed_size;
+    int64_t fixed_a_slot;
+    int64_t fixed_v_slot;
+}jmm_mp4_muxer_ctx;
+
+static jhandle jmm_mp4_muxer_open(const char *url)
+{
+    if (url == NULL)
+        return NULL;
+
+    jmm_mp4_muxer_ctx *ctx = (jmm_mp4_muxer_ctx *)jmalloc(sizeof(jmm_mp4_muxer_ctx));
+    if (ctx == NULL)
+        return NULL;
+    memset(ctx, 0, sizeof(jmm_mp4_muxer_ctx));
+
+    ctx->url = jstring_copy(url);
+    //0x7C25B080 1970 -> 1904
+    ctx->creation_time = time(NULL)+0x7C25B080;
+
+    jstring f;
+    f = jstring_link(url, ".aentry");
+    ctx->w_aentry = jbufwriter_open(tostring(f), 0);
+    jstring_free(f);
+    f = jstring_link(url, ".ventry");
+    ctx->w_ventry = jbufwriter_open(tostring(f), 0);
+    jstring_free(f);
+
+    //mdat
+    f = jstring_link(url, ".mdat");
+    ctx->w_mdat = jbufwriter_open(tostring(f), 0);
+    jstring_free(f);
+    //mdat - 64bit
+    //size slot
+    jbufwriter_B32(ctx->w_mdat, 1);
+    jbufwriter_B32(ctx->w_mdat, ('m'<<24)|('d'<<16)|('a'<<8)|'t');
+    jbufwriter_B32(ctx->w_mdat, 0);
+    jbufwriter_B32(ctx->w_mdat, 0);
+
+    return ctx;
+}
+
+static int jmm_mp4_muxer_mvhd(jmm_mp4_muxer_ctx *ctx)
+{
+    if (ctx == NULL)
+        return ERROR_FAIL;
+
+    //size
+    WB32(0x6c);
+    //fourcc
+    write_fourcc('m','v','h','d');
+    //full box
+    WB32(0);
+    //creation_time
+    //modification_time
+    WB32(ctx->creation_time);
+    WB32(ctx->creation_time);
+    //timescale
+    WB32(90000);
+    //duration
+    if (ctx->a_dur_sec > ctx->v_dur_sec)
+        WB32(ctx->a_dur_sec*90000);
+    else
+        WB32(ctx->v_dur_sec*90000);
+    WB32(0x00010000);
+    WB16(0x0100);
+    jbufwriter_dump(ctx->wt, 10, 0);
+    //matrix
+    WB32(0x00010000);
+    WB32(0);
+    WB32(0);
+    WB32(0);
+    WB32(0x00010000);
+    WB32(0);
+    WB32(0);
+    WB32(0);
+    WB32(0x40000000);
+    jbufwriter_dump(ctx->wt, 24, 0);
+    //next_track_ID
+    WB32(3);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_tkhd(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    WB32(0x5c);
+    //fourcc
+    write_fourcc('t','k','h','d');
+    //full box
+    //version
+    W8(0);
+    //flags -> enabled | in_moive
+    WB24(0x3);
+    //creation_time
+    //modification_time
+    WB32(ctx->creation_time);
+    WB32(ctx->creation_time);
+    if (!video)
+    {
+        //track_ID
+        WB32(2);
+        WB32(0);
+        //duration
+        WB32(ctx->a_dur_sec*90000);
+    }
+    else
+    {
+        //track_ID
+        WB32(1);
+        WB32(0);
+        //duration
+        WB32(ctx->v_dur_sec*90000);
+    }
+    jbufwriter_dump(ctx->wt, 12, 0);
+    if (!video)
+        WB16(0x0100);
+    else
+        WB16(0);
+    WB16(0);
+    //matrix
+    WB32(0x00010000);
+    WB32(0);
+    WB32(0);
+    WB32(0);
+    WB32(0x00010000);
+    WB32(0);
+    WB32(0);
+    WB32(0);
+    WB32(0x40000000);
+    //width height 16.16 fixed-point
+    WB16(ctx->vinfo.width);
+    WB16(0);
+    WB16(ctx->vinfo.height);
+    WB16(0);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_mdhd(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    WB32(0x20);
+    //fourcc
+    write_fourcc('m','d','h','d');
+    //full box
+    WB32(0);
+    //creation_time
+    //modification_time
+    WB32(ctx->creation_time);
+    WB32(ctx->creation_time);
+    if (!video)
+    {
+        //timescale
+        WB32(ctx->ainfo.samplerate);
+        //duration
+        WB32(ctx->a_dur_sec*ctx->ainfo.samplerate);
+    }
+    else
+    {
+        //timescale
+        WB32(90000);
+        //duration
+        WB32(ctx->v_dur_sec*90000);
+    }
+    //language ISO-639-2/T language code
+    //und
+    WB16(0x55c4);
+    WB16(0);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_hdlr(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('h','d','l','r');
+
+    //full box
+    WB32(0);
+    //pre_defined
+    WB32(0);
+    //handler_type
+    if (!video)
+        write_fourcc('s','o','u','n');
+    else
+        write_fourcc('v','i','d','e');
+    jbufwriter_dump(ctx->wt, 12, 0);
+
+    //name -> :)
+    const char *my_name = "This file is generated by jmm_mp4_muxer(mm library writed by chuanjiong :) )";
+    jbufwriter_write(ctx->wt, (uint8_t *)my_name, strlen(my_name));
+    W8(0);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_mhd(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    if (!video)
+    {
+        //smhd
+        //size
+        WB32(0x10);
+        //fourcc
+        write_fourcc('s','m','h','d');
+        //full box
+        WB32(0);
+        WB16(0);
+        WB16(0);
+    }
+    else
+    {
+        //vmhd
+        //size
+        WB32(0x14);
+        //fourcc
+        write_fourcc('v','m','h','d');
+        //full box
+        WB32(1);
+        WB16(0);
+        WB16(0);
+        WB16(0);
+        WB16(0);
+    }
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_ase(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //mp4a box
+    WB32(0x4b);
+    write_fourcc('m','p','4','a');
+    jbufwriter_dump(ctx->wt, 6, 0);
+    WB16(1);
+
+    jbufwriter_dump(ctx->wt, 8, 0);
+    //channelcount
+    WB16(ctx->ainfo.channels);
+    //samplesize
+    WB16(16);
+    WB32(0);
+    //samplerate << 16
+    WB32(ctx->ainfo.samplerate<<16);
+
+    //esds box
+    WB32(0x27);
+    write_fourcc('e','s','d','s');
+    //full box
+    WB32(0);
+
+    //FIXME
+    uint8_t buf[32] = {3, 0x19, 0, 2, 0, 4, 0x11, 0x40, 0x15, 0};
+    jbufwriter_write(ctx->wt, buf, 20);
+    W8(0x05);
+    W8(ctx->asc->size); //assume size < 128
+    jbufwriter_write(ctx->wt, ctx->asc->data, ctx->asc->size);
+
+    WB24(0x060102);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_vse(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('a','v','c','1');
+
+    jbufwriter_dump(ctx->wt, 6, 0);
+    WB16(1);
+
+    jbufwriter_dump(ctx->wt, 16, 0);
+
+    //width & height
+    WB16(ctx->vinfo.width);
+    WB16(ctx->vinfo.height);
+
+    WB32(0x00480000);
+    WB32(0x00480000);
+
+    WB32(0);
+    //frame_count
+    WB16(1);
+
+    //compressorname
+    jbufwriter_dump(ctx->wt, 32, 0);
+
+    WB16(0x18);
+    //pre_defined = -1
+    WB16(0xffff);
+
+    //avcC
+    //size
+    WB32(ctx->avcc->size+8);
+    write_fourcc('a','v','c','C');
+    jbufwriter_write(ctx->wt, ctx->avcc->data, ctx->avcc->size);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_stsd(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('s','t','s','d');
+    //full box
+    WB32(0);
+
+    //entry_count
+    WB32(1);
+
+    if (!video)
+    {
+        //AudioSampleEntry
+        jmm_mp4_muxer_ase(ctx, entry, video);
+    }
+    else
+    {
+        //VisualSampleEntry
+        jmm_mp4_muxer_vse(ctx, entry, video);
+    }
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_stts(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    int i, count, timebase;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('s','t','t','s');
+    //full box
+    WB32(0);
+
+    //entry_count
+    if (!video)
+    {
+        count = ctx->a_count;
+        timebase = ctx->ainfo.samplerate;
+    }
+    else
+    {
+        count = ctx->v_count;
+        timebase = 90000;
+    }
+    WB32(count);
+
+    jmm_mp4_muxer_entry temp;
+    jbufreader_seek(entry, 0, SEEK_SET);
+    for (i=0; i<count; i++)
+    {
+        jbufreader_read(entry, &temp, sizeof(jmm_mp4_muxer_entry));
+        //sample_count
+        WB32(1);
+        //sample_delta
+        WB32(temp.duration*timebase/1000000);
+    }
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_stsz(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    int i, count;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('s','t','s','z');
+    //full box
+    WB32(0);
+
+    //sample_size
+    WB32(0);
+    //sample_count
+    if (!video)
+        count = ctx->a_count;
+    else
+        count = ctx->v_count;
+    WB32(count);
+
+    jmm_mp4_muxer_entry temp;
+    jbufreader_seek(entry, 0, SEEK_SET);
+    for (i=0; i<count; i++)
+    {
+        jbufreader_read(entry, &temp, sizeof(jmm_mp4_muxer_entry));
+        WB32(temp.size);
+    }
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_stsc(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('s','t','s','c');
+    //full box
+    WB32(0);
+
+    //entry_count
+    WB32(1);
+    //first_chunk
+    WB32(1);
+    //samples_per_chunk
+    WB32(1);
+    //sample_description_index
+    WB32(1);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_co64(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    int i, count;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('c','o','6','4');
+    //full box
+    WB32(0);
+
+    //entry_count
+    if (!video)
+        count = ctx->a_count;
+    else
+        count = ctx->v_count;
+    WB32(count);
+
+    if (!video)
+        ctx->fixed_a_slot = jbufwriter_tell(ctx->wt);
+    else
+        ctx->fixed_v_slot = jbufwriter_tell(ctx->wt);
+
+    jmm_mp4_muxer_entry temp;
+    jbufreader_seek(entry, 0, SEEK_SET);
+    for (i=0; i<count; i++)
+    {
+        jbufreader_read(entry, &temp, sizeof(jmm_mp4_muxer_entry));
+        WB32(temp.offset>>32);
+        WB32(temp.offset&0xffffffff);
+    }
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_ctts(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    if (!video)
+        return SUCCESS;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('c','t','t','s');
+    //full box
+    WB32(0);
+
+    //entry_count
+    WB32(ctx->v_count);
+
+    int i;
+    jmm_mp4_muxer_entry temp;
+    jbufreader_seek(entry, 0, SEEK_SET);
+    for (i=0; i<ctx->v_count; i++)
+    {
+        jbufreader_read(entry, &temp, sizeof(jmm_mp4_muxer_entry));
+        //sample_count
+        WB32(1);
+        //sample_offset
+        WB32((temp.pts-temp.dts)*9/100);
+    }
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_stss(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    if (!video)
+        return SUCCESS;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('s','t','s','s');
+    //full box
+    WB32(0);
+
+    //entry_count
+    int slot1 = jbufwriter_tell(ctx->wt);
+    WB32(0);
+
+    int i, count;
+    jmm_mp4_muxer_entry temp;
+    jbufreader_seek(entry, 0, SEEK_SET);
+    for (i=0,count=0; i<ctx->v_count; i++)
+    {
+        jbufreader_read(entry, &temp, sizeof(jmm_mp4_muxer_entry));
+        if (temp.key)
+        {
+            WB32(i+1);
+            count++;
+        }
+    }
+
+    jbufwriter_seek(ctx->wt, slot1, SEEK_SET);
+    WB32(count);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_stbl(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('s','t','b','l');
+
+    //stsd
+    jmm_mp4_muxer_stsd(ctx, entry, video);
+
+    //stts
+    jmm_mp4_muxer_stts(ctx, entry, video);
+
+    //stsz
+    jmm_mp4_muxer_stsz(ctx, entry, video);
+
+    //stsc
+    jmm_mp4_muxer_stsc(ctx, entry, video);
+
+    //co64
+    jmm_mp4_muxer_co64(ctx, entry, video);
+
+    //ctts
+    jmm_mp4_muxer_ctts(ctx, entry, video);
+
+    //stss
+    jmm_mp4_muxer_stss(ctx, entry, video);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_dinf(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //dinf
+    //size
+    WB32(0x24);
+    //fourccc
+    write_fourcc('d','i','n','f');
+
+    //dref
+    WB32(0x1c);
+    write_fourcc('d','r','e','f');
+    //full box
+    WB32(0);
+    //entry_count
+    WB32(1);
+
+    //url
+    WB32(0xc);
+    write_fourcc('u','r','l',' ');
+    //full box
+    WB32(1);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_minf(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('m','i','n','f');
+
+    //mhd
+    jmm_mp4_muxer_mhd(ctx, entry, video);
+
+    //stbl
+    jmm_mp4_muxer_stbl(ctx, entry, video);
+
+    //dinf
+    jmm_mp4_muxer_dinf(ctx, entry, video);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_mdia(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('m','d','i','a');
+
+    //mdhd
+    jmm_mp4_muxer_mdhd(ctx, entry, video);
+
+    //hdlr
+    jmm_mp4_muxer_hdlr(ctx, entry, video);
+
+    //minf
+    jmm_mp4_muxer_minf(ctx, entry, video);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static int jmm_mp4_muxer_trak(jmm_mp4_muxer_ctx *ctx, jhandle entry, jbool video)
+{
+    if ((ctx==NULL) || (entry==NULL))
+        return ERROR_FAIL;
+
+    //size
+    int slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    //fourcc
+    write_fourcc('t','r','a','k');
+
+    //tkhd
+    jmm_mp4_muxer_tkhd(ctx, entry, video);
+
+    //mdia
+    jmm_mp4_muxer_mdia(ctx, entry, video);
+
+    int cur = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, slot, SEEK_SET);
+    WB32(cur-slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    return SUCCESS;
+}
+
+static void jmm_mp4_muxer_free_box(jhandle w, int size)
+{
+    if ((w==NULL) || (size<8))
+        return;
+    //size
+    jbufwriter_B32(w, size);
+    //fourcc
+    jbufwriter_B32(w, ('f'<<24)|('r'<<16)|('e'<<8)|'e');
+    jbufwriter_dump(w, size-8, 0);
+}
+
+static void jmm_mp4_muxer_close(jhandle h)
+{
+    if (h == NULL)
+        return;
+
+    jmm_mp4_muxer_ctx *ctx = (jmm_mp4_muxer_ctx *)h;
+
+    ctx->aentry_idx = (ctx->aentry_idx+1) % 2;
+    ctx->ventry_idx = (ctx->ventry_idx+1) % 2;
+    ctx->aentry[ctx->aentry_idx].duration = ctx->a_sample_duration;
+    jbufwriter_write(ctx->w_aentry, &(ctx->aentry[ctx->aentry_idx]), sizeof(jmm_mp4_muxer_entry));
+    ctx->ventry[ctx->ventry_idx].duration = ctx->v_sample_duration;
+    jbufwriter_write(ctx->w_ventry, &(ctx->ventry[ctx->ventry_idx]), sizeof(jmm_mp4_muxer_entry));
+    jbufwriter_close(ctx->w_aentry);
+    jbufwriter_close(ctx->w_ventry);
+
+    ctx->a_duration += ctx->a_sample_duration;
+    ctx->v_duration += ctx->v_sample_duration;
+    ctx->a_dur_sec = ctx->a_duration/1000000;
+    ctx->v_dur_sec = ctx->v_duration/1000000;
+
+    ctx->wt = jbufwriter_open(tostring(ctx->url), 0);
+
+    //ftyp
+    uint8_t buf[32] = {0, 0, 0, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2', 0, 0, 0, 0, 'i', 's', 'o', 'm', 'm', 'p', '4', '2'};
+    jbufwriter_write(ctx->wt, buf, 0x18);
+
+    //moov
+    //size slot
+    int64_t moov_size_slot = jbufwriter_tell(ctx->wt);
+    WB32(0);
+    write_fourcc('m','o','o','v');
+
+    jmm_mp4_muxer_mvhd(ctx);
+
+    jstring f;
+    f = jstring_link(tostring(ctx->url), ".ventry");
+    jhandle ventry = jbufreader_open(tostring(f));
+    jstring_free(f);
+    if ((ctx->v_count > 0) && ventry)
+        jmm_mp4_muxer_trak(ctx, ventry, jtrue);
+    f = jstring_link(tostring(ctx->url), ".aentry");
+    jhandle aentry = jbufreader_open(tostring(f));
+    jstring_free(f);
+    if ((ctx->a_count > 0) && aentry)
+        jmm_mp4_muxer_trak(ctx, aentry, jfalse);
+
+    //moov size
+    int64_t size = jbufwriter_tell(ctx->wt);
+    jbufwriter_seek(ctx->wt, moov_size_slot, SEEK_SET);
+    WB32(size-moov_size_slot);
+    jbufwriter_seek(ctx->wt, 0, SEEK_END);
+
+    //add 'free' box to align 4k
+    int left = size % 4096;
+    if (left > (4096-8))
+        jmm_mp4_muxer_free_box(ctx->wt, 8192-left);
+    else
+        jmm_mp4_muxer_free_box(ctx->wt, 4096-left);
+
+    //finally, fixed offset
+    ctx->fixed_size = jbufwriter_tell(ctx->wt);
+    if (ctx->v_count > 0)
+    {
+        jbufwriter_seek(ctx->wt, ctx->fixed_v_slot, SEEK_SET);
+        int i;
+        jmm_mp4_muxer_entry temp;
+        jbufreader_seek(ventry, 0, SEEK_SET);
+        for (i=0; i<ctx->v_count; i++)
+        {
+            jbufreader_read(ventry, &temp, sizeof(jmm_mp4_muxer_entry));
+            temp.offset += ctx->fixed_size;
+            WB32(temp.offset>>32);
+            WB32(temp.offset&0xffffffff);
+        }
+    }
+    if (ctx->a_count > 0)
+    {
+        jbufwriter_seek(ctx->wt, ctx->fixed_a_slot, SEEK_SET);
+        int i;
+        jmm_mp4_muxer_entry temp;
+        jbufreader_seek(aentry, 0, SEEK_SET);
+        for (i=0; i<ctx->a_count; i++)
+        {
+            jbufreader_read(aentry, &temp, sizeof(jmm_mp4_muxer_entry));
+            temp.offset += ctx->fixed_size;
+            WB32(temp.offset>>32);
+            WB32(temp.offset&0xffffffff);
+        }
+    }
+    jbufreader_close(ventry);
+    jbufreader_close(aentry);
+    jbufwriter_close(ctx->wt);
+
+    //fixed mdat size
+    size = jbufwriter_tell(ctx->w_mdat);
+    jbufwriter_seek(ctx->w_mdat, 8, SEEK_SET);
+    jbufwriter_B32(ctx->w_mdat, size>>32);
+    jbufwriter_B32(ctx->w_mdat, size&0xffffffff);
+    jbufwriter_close(ctx->w_mdat);
+
+    //append .mdat file
+    f = jstring_link(tostring(ctx->url), ".mdat");
+    file_merge(tostring(ctx->url), tostring(f));
+    jstring_free(f);
+
+    //remove aentry ventry
+    f = jstring_link(tostring(ctx->url), ".aentry");
+    remove(tostring(f));
+    jstring_free(f);
+    f = jstring_link(tostring(ctx->url), ".ventry");
+    remove(tostring(f));
+    jstring_free(f);
+
+    jstring_free(ctx->url);
+    if (ctx->avcc)
+        jmm_packet_free(ctx->avcc);
+    if (ctx->asc)
+        jmm_packet_free(ctx->asc);
+    jfree(ctx);
+}
+
+static int jmm_mp4_muxer_write(jhandle h, jmm_packet *packet)
+{
+    if ((h==NULL) || (packet==NULL))
+        return ERROR_FAIL;
+
+    jmm_mp4_muxer_ctx *ctx = (jmm_mp4_muxer_ctx *)h;
+
+    //wait asc
+    if (!ctx->asc)
+        if ((packet->type==JMM_CODEC_TYPE_AAC) && (packet->fmt!=JMM_BS_FMT_AAC_ASC))
+        {
+            //jwarn("[jmm_mp4_muxer] drop aac pkt: %d\n", packet->fmt);
+            return ERROR_FAIL;
+        }
+
+    //wait avcc
+    if (!ctx->avcc)
+        if ((packet->type==JMM_CODEC_TYPE_AVC) && (packet->fmt!=JMM_BS_FMT_AVC_AVCC))
+        {
+            //jwarn("[jmm_mp4_muxer] drop avc pkt: %d\n", packet->fmt);
+            return ERROR_FAIL;
+        }
+
+    jbool copy = jfalse;
+    jmm_packet *pkt = packet;
+    if ((packet->type==JMM_CODEC_TYPE_AAC) && (packet->fmt==JMM_BS_FMT_AAC_ADTS))
+    {
+        pkt = jmm_aac_adts2es(packet, jtrue);
+        copy = jtrue;
+    }
+    else if ((packet->type==JMM_CODEC_TYPE_AVC) && (packet->fmt==JMM_BS_FMT_AVC_ANNEXB))
+    {
+        pkt = jmm_avc_annexb2mp4(packet, jtrue);
+        copy = jtrue;
+    }
+
+    if (pkt == NULL)
+        return ERROR_FAIL;
+
+    if ((pkt->type==JMM_CODEC_TYPE_AAC) && (pkt->fmt==JMM_BS_FMT_AAC_ASC))
+    {
+        if (ctx->asc)
+            jmm_packet_free(ctx->asc);
+        ctx->asc = jmm_packet_clone(pkt);
+        jmm_aac_asc_parse(ctx->asc, &(ctx->ainfo));
+        return SUCCESS;
+    }
+    else if ((pkt->type==JMM_CODEC_TYPE_AVC) && (pkt->fmt==JMM_BS_FMT_AVC_AVCC))
+    {
+        if (ctx->avcc)
+            jmm_packet_free(ctx->avcc);
+        ctx->avcc = jmm_packet_clone(pkt);
+        jmm_avc_avcc_parse(ctx->avcc, &(ctx->vinfo));
+        return SUCCESS;
+    }
+
+    if (pkt->type == JMM_CODEC_TYPE_AAC)
+    {
+        ctx->aentry[ctx->aentry_idx].key = pkt->key;
+        ctx->aentry[ctx->aentry_idx].dts = pkt->dts;
+        ctx->aentry[ctx->aentry_idx].pts = pkt->pts;
+        ctx->aentry[ctx->aentry_idx].size = pkt->size;
+        ctx->aentry[ctx->aentry_idx].offset = jbufwriter_tell(ctx->w_mdat);
+        if (ctx->a_count != 0)
+        {
+            ctx->a_sample_duration = pkt->dts - ctx->prev_a_dts;
+            ctx->aentry[(ctx->aentry_idx+1)%2].duration = ctx->a_sample_duration;
+            jbufwriter_write(ctx->w_aentry, &(ctx->aentry[(ctx->aentry_idx+1)%2]), sizeof(jmm_mp4_muxer_entry));
+        }
+        jbufwriter_write(ctx->w_mdat, pkt->data, pkt->size);
+        ctx->a_duration += ctx->a_sample_duration;
+        ctx->aentry_idx = (ctx->aentry_idx+1) % 2;
+        ctx->a_count++;
+        ctx->prev_a_dts = pkt->dts;
+    }
+    else if (pkt->type == JMM_CODEC_TYPE_AVC)
+    {
+        ctx->ventry[ctx->ventry_idx].key = pkt->key;
+        ctx->ventry[ctx->ventry_idx].dts = pkt->dts;
+        ctx->ventry[ctx->ventry_idx].pts = pkt->pts;
+        ctx->ventry[ctx->ventry_idx].size = pkt->size;
+        ctx->ventry[ctx->ventry_idx].offset = jbufwriter_tell(ctx->w_mdat);
+        if (ctx->v_count != 0)
+        {
+            ctx->v_sample_duration = pkt->dts - ctx->prev_v_dts;
+            ctx->ventry[(ctx->ventry_idx+1)%2].duration = ctx->v_sample_duration;
+            jbufwriter_write(ctx->w_ventry, &(ctx->ventry[(ctx->ventry_idx+1)%2]), sizeof(jmm_mp4_muxer_entry));
+        }
+        jbufwriter_write(ctx->w_mdat, pkt->data, pkt->size);
+        ctx->v_duration += ctx->v_sample_duration;
+        ctx->ventry_idx = (ctx->ventry_idx+1) % 2;
+        ctx->v_count++;
+        ctx->prev_v_dts = pkt->dts;
+    }
+
+    if (copy)
+        jmm_packet_free(pkt);
+
+    return SUCCESS;
+}
+
+const jmm_muxer jmm_mp4_muxer = {
+    jmm_mp4_muxer_open,
+    jmm_mp4_muxer_close,
+    jmm_mp4_muxer_write
+};
+
+
